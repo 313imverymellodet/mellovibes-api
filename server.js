@@ -17,9 +17,21 @@ const ORIGINS = (process.env.FRONTEND_ORIGIN || '*').split(',').map(s => s.trim(
 app.use(cors({ origin: ORIGINS.includes('*') ? true : ORIGINS }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-railway';
+
+const DB_URL = process.env.DATABASE_URL;
+if (!DB_URL) {
+  console.error('\n[FATAL] DATABASE_URL is not set.\n' +
+    'In Railway: open the mellovibes-api service → Variables → New Variable →\n' +
+    'Add Reference → select the Postgres service\'s DATABASE_URL. Then redeploy.\n');
+  process.exit(1);
+}
+// Railway's INTERNAL url (postgres.railway.internal) doesn't use SSL; the PUBLIC
+// proxy url does. Only enable SSL when it's actually a public/remote host.
+const needsSsl = /sslmode=require/i.test(DB_URL) ||
+  (!DB_URL.includes('railway.internal') && !DB_URL.includes('localhost') && !DB_URL.includes('127.0.0.1'));
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+  connectionString: DB_URL,
+  ssl: needsSsl ? { rejectUnauthorized: false } : false
 });
 
 // ── DB schema ──
