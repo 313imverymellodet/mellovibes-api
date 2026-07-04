@@ -166,27 +166,130 @@ app.delete('/api/invite-codes/:code', auth, adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Jellyfin brokering: hides server creds from the frontend ──
-// The frontend calls this (with its JWT) to get a Jellyfin token, instead of
-// embedding the Jellyfin username/password in the page source.
-app.get('/api/jellyfin', auth, async (req, res) => {
-  const url = process.env.JELLYFIN_URL;
-  const user = process.env.JELLYFIN_USERNAME;
-  const pass = process.env.JELLYFIN_PASSWORD;
-  if (!url || !user || !pass) return res.status(501).json({ error: 'Jellyfin not configured on server' });
-  try {
-    // Per-account device identity so Jellyfin /Sessions can tell people apart
-    const deviceId = 'mv-' + (req.user.username || 'user');
-    const authHeader = `MediaBrowser Client="MelloVibes", Device="${(req.user.name||'Browser').replace(/"/g,'')}", DeviceId="${deviceId}", Version="1.0.0"`;
-    const r = await fetch(`${url}/Users/AuthenticateByName`, {
+// ══════════════════════════════════════════════════════════════
+// Jellyfin brokering — per-user profiles
+//
+// Each MelloVibes account gets its OWN Jellyfin user (mv_<username>), created
+// on demand via the admin API, so Continue Watching / My List / watched state
+// are personal. The MelloVibes admin account maps to the original Jellyfin
+// user (JELLYFIN_USERNAME) so existing watch history is preserved.
+// ══════════════════════════════════════════════════════════════
+const crypto = require('crypto');
+const JF_URL = () => process.env.JELLYFIN_URL;
+
+function jfDeviceHeader(name, deviceId) {
+  return `MediaBrowser Client="MelloVibes", Device="${String(name||'Browser').replace(/"/g,'')}", DeviceId="${deviceId}", Version="1.0.0"`;
+}
+// Deterministic per-account Jellyfin password (never shown to anyone)
+function jfUserPassword(username) {
+  return crypto.createHmac('sha256', JWT_SECRET).update('jf:' + username).digest('hex').slice(0, 24);
+}
+
+async function jfAuthenticate(username, password, deviceName, deviceId) {
+  const r = await fetch(`${JF_URL()}/Users/AuthenticateByName`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': jfDeviceHeader(deviceName, deviceId) },
+    body: JSON.stringify({ Username: username, Pw: password })
+  });
+  if (!r.ok) return null;
+  return r.json();
+}
+
+// Cached admin token (the env account must be a Jellyfin administrator)
+let _adminCache = null;
+async function jfAdminToken(force = false) {
+  if (_adminCache && !force && Date.now() - _adminCache.at < 12 * 3600e3) return _adminCache.token;
+  const data = await jfAuthenticate(process.env.JELLYFIN_USERNAME, process.env.JELLYFIN_PASSWORD, 'MelloVibes-API', 'mv-api-admin');
+  if (!data) throw new Error('Jellyfin admin auth failed');
+  _adminCache = { token: data.AccessToken, at: Date.now() };
+  return _adminCache.token;
+}
+async function jfAdminFetch(path, opts = {}, retried = false) {
+  const token = await jfAdminToken();
+  const r = await fetch(`${JF_URL()}${path}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', 'X-Emby-Token': token, ...(opts.headers || {}) }
+  });
+  if (r.status === 401 && !retried) { await jfAdminToken(true); return jfAdminFetch(path, opts, true); }
+  return r;
+}
+
+// Find-or-create the Jellyfin user for a MelloVibes account
+async function ensureJfUser(mvUsername) {
+  const jfName = 'mv_' + mvUsername;
+  const list = await (await jfAdminFetch('/Users')).json();
+  let u = (list || []).find(x => x.Name && x.Name.toLowerCase() === jfName.toLowerCase());
+  if (!u) {
+    const cr = await jfAdminFetch('/Users/New', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
-      body: JSON.stringify({ Username: user, Pw: pass })
+      body: JSON.stringify({ Name: jfName, Password: jfUserPassword(mvUsername) })
     });
-    if (!r.ok) return res.status(502).json({ error: 'Jellyfin auth failed', status: r.status });
-    const data = await r.json();
-    res.json({ url, token: data.AccessToken, userId: data.User.Id, deviceId });
-  } catch (e) { console.error(e); res.status(502).json({ error: 'Could not reach Jellyfin' }); }
+    if (!cr.ok) throw new Error(`Could not create Jellyfin user (${cr.status})`);
+    u = await cr.json();
+    // Grant access to all libraries; keep them non-admin
+    await jfAdminFetch(`/Users/${u.Id}/Policy`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...u.Policy, IsAdministrator: false, EnableAllFolders: true,
+        EnableMediaPlayback: true, EnablePlaybackRemuxing: true,
+        EnableVideoPlaybackTranscoding: true, EnableAudioPlaybackTranscoding: true,
+        EnableContentDownloading: false, EnableSyncTranscoding: false, AuthenticationProviderId: u.Policy?.AuthenticationProviderId
+      })
+    }).catch(() => {});
+    console.log(`[jellyfin] created profile user "${jfName}"`);
+  }
+  return jfName;
+}
+
+app.get('/api/jellyfin', auth, async (req, res) => {
+  if (!JF_URL() || !process.env.JELLYFIN_USERNAME || !process.env.JELLYFIN_PASSWORD) {
+    return res.status(501).json({ error: 'Jellyfin not configured on server' });
+  }
+  const mvUser = (req.user.username || 'user').toLowerCase();
+  const deviceId = 'mv-' + mvUser;
+  const isOwner = mvUser === (process.env.ADMIN_USERNAME || 'mello').toLowerCase();
+  try {
+    let data;
+    if (isOwner) {
+      // The owner keeps the original Jellyfin user (and all existing watch history)
+      data = await jfAuthenticate(process.env.JELLYFIN_USERNAME, process.env.JELLYFIN_PASSWORD, req.user.name, deviceId);
+      if (!data) return res.status(502).json({ error: 'Jellyfin auth failed' });
+    } else {
+      const jfName = await ensureJfUser(mvUser);
+      data = await jfAuthenticate(jfName, jfUserPassword(mvUser), req.user.name, deviceId);
+      if (!data) {
+        // Password drift (e.g. JWT_SECRET changed) → reset via admin and retry once
+        const list = await (await jfAdminFetch('/Users')).json();
+        const u = (list || []).find(x => x.Name && x.Name.toLowerCase() === jfName.toLowerCase());
+        if (u) {
+          await jfAdminFetch(`/Users/${u.Id}/Password`, { method: 'POST', body: JSON.stringify({ ResetPassword: true }) });
+          await jfAdminFetch(`/Users/${u.Id}/Password`, { method: 'POST', body: JSON.stringify({ CurrentPw: '', NewPw: jfUserPassword(mvUser) }) });
+          data = await jfAuthenticate(jfName, jfUserPassword(mvUser), req.user.name, deviceId);
+        }
+        if (!data) return res.status(502).json({ error: 'Jellyfin profile auth failed' });
+      }
+    }
+    res.json({ url: JF_URL(), token: data.AccessToken, userId: data.User.Id, deviceId, profile: data.User.Name });
+  } catch (e) { console.error('[jellyfin broker]', e.message); res.status(502).json({ error: 'Could not reach Jellyfin' }); }
+});
+
+// Live "Now Watching" presence for everyone — uses the admin token server-side,
+// since per-user tokens can only see their own sessions.
+app.get('/api/sessions', auth, async (_req, res) => {
+  try {
+    const r = await jfAdminFetch('/Sessions');
+    if (!r.ok) return res.status(502).json({ error: 'Sessions unavailable' });
+    const sessions = await r.json();
+    const active = (sessions || []).filter(s => s.NowPlayingItem).map(s => ({
+      DeviceId: s.DeviceId, DeviceName: s.DeviceName, UserName: s.UserName,
+      NowPlayingItem: {
+        Id: s.NowPlayingItem.Id, Name: s.NowPlayingItem.Name,
+        SeriesName: s.NowPlayingItem.SeriesName || null, RunTimeTicks: s.NowPlayingItem.RunTimeTicks || 0
+      },
+      PlayState: { PositionTicks: s.PlayState?.PositionTicks || 0, IsPaused: !!s.PlayState?.IsPaused }
+    }));
+    res.json({ sessions: active });
+  } catch (e) { console.error('[sessions]', e.message); res.status(502).json({ error: 'Could not reach Jellyfin' }); }
 });
 
 const PORT = process.env.PORT || 3000;
